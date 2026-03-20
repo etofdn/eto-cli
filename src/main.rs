@@ -697,8 +697,8 @@ fn cmd_config_set(args: &[String]) {
 }
 
 fn cmd_address() {
-    let payer = payer_keypair();
-    let addr = pubkey_b58(&pubkey_of(&payer));
+    let key = active_keypair();
+    let addr = pubkey_b58(&pubkey_of(&key));
     println!("{}", addr);
 }
 
@@ -976,7 +976,8 @@ fn cmd_account(rpc: &str, addr_str: &str) {
         Ok(result) => {
             let value = result.get("value");
             if value.is_none() || value.unwrap().is_null() {
-                println!("Error: account not found: {}", b58);
+                eprintln!("Account not found: {}", b58);
+                eprintln!("This address has no on-chain state. Fund it with: eto airdrop 1000000000 {}", b58);
                 std::process::exit(1);
             }
             let value = value.unwrap();
