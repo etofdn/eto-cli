@@ -1,4 +1,4 @@
-# eto
+# YOLO
 
 Command-line interface for the [ETO Universal VM](https://github.com/etofdn/etovm).
 
