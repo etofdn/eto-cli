@@ -786,7 +786,7 @@ fn cmd_airdrop(rpc: &str, amount_str: &str, addr_str: Option<&str>) {
     }
 
     // Show updated balance
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(1));
     if let Ok(v) = rpc_call(&client, rpc, "getBalance", serde_json::json!([b58])) {
         let lamports = v.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
         println!("{} lamports", lamports);
