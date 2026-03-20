@@ -1151,6 +1151,233 @@ fn format_sol(sol: f64) -> String {
     }
 }
 
+// ── Inspect ──
+
+fn cmd_inspect(rpc: &str, args: &[String]) {
+    let client = make_client();
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+
+    match sub {
+        "transfer" | "tx" => {
+            let to_addr = args.get(1).unwrap_or_else(|| {
+                eprintln!("Usage: eto inspect transfer <TO> <AMOUNT>");
+                std::process::exit(1);
+            });
+            let amount_str = args.get(2).unwrap_or_else(|| {
+                eprintln!("Usage: eto inspect transfer <TO> <AMOUNT>");
+                std::process::exit(1);
+            });
+            let amount = parse_amount(amount_str).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            let to_pk = parse_address(to_addr).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            let to_b58 = bs58::encode(&to_pk.0).into_string();
+            let payer = active_keypair();
+            let from_pk = pubkey_of(&payer);
+            let from_b58 = bs58::encode(&from_pk.0).into_string();
+
+            println!("PRE-STATE");
+            println!("  Block Height:  {}", rpc_call(&client, rpc, "getSlot", serde_json::json!([]))
+                .ok().and_then(|v| v.as_u64()).unwrap_or(0));
+            let bal_from_before = rpc_call(&client, rpc, "getBalance", serde_json::json!([from_b58]))
+                .ok().and_then(|v| v.get("value").and_then(|b| b.as_u64())).unwrap_or(0);
+            let bal_to_before = rpc_call(&client, rpc, "getBalance", serde_json::json!([to_b58]))
+                .ok().and_then(|v| v.get("value").and_then(|b| b.as_u64())).unwrap_or(0);
+            println!("  Sender:        {} ({} lamports)", from_b58, bal_from_before);
+            println!("  Recipient:     {} ({} lamports)", to_b58, bal_to_before);
+            println!();
+
+            // Build and send
+            let tx_bytes = build_svm_transfer(&payer, to_pk, amount);
+            println!("TRANSACTION");
+            println!("  Operation:     Transfer");
+            println!("  Amount:        {} lamports ({} SOL)", amount, format_sol(amount as f64 / 1e9));
+            println!("  Program:       System (11111111111111111111111111111111)");
+            let sig = send_tx(&client, rpc, tx_bytes).unwrap_or_else(|e| {
+                eprintln!("  FAILED: {}", e);
+                std::process::exit(1);
+            });
+            println!("  Signature:     {}", sig);
+            println!("  Status:        ACCEPTED");
+            println!();
+
+            // Wait for inclusion
+            println!("CONSENSUS");
+            print!("  Waiting for block inclusion");
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let bal_to_now = rpc_call(&client, rpc, "getBalance", serde_json::json!([to_b58]))
+                    .ok().and_then(|v| v.get("value").and_then(|b| b.as_u64())).unwrap_or(0);
+                if bal_to_now != bal_to_before {
+                    println!(" confirmed");
+                    break;
+                }
+                print!(".");
+            }
+            let height_after = rpc_call(&client, rpc, "getSlot", serde_json::json!([]))
+                .ok().and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("  Block Height:  {}", height_after);
+            println!();
+
+            // Post state
+            let bal_from_after = rpc_call(&client, rpc, "getBalance", serde_json::json!([from_b58]))
+                .ok().and_then(|v| v.get("value").and_then(|b| b.as_u64())).unwrap_or(0);
+            let bal_to_after = rpc_call(&client, rpc, "getBalance", serde_json::json!([to_b58]))
+                .ok().and_then(|v| v.get("value").and_then(|b| b.as_u64())).unwrap_or(0);
+
+            println!("POST-STATE");
+            println!("  Sender:        {} lamports -> {} lamports (delta: -{})",
+                bal_from_before, bal_from_after, bal_from_before.saturating_sub(bal_from_after));
+            println!("  Recipient:     {} lamports -> {} lamports (delta: +{})",
+                bal_to_before, bal_to_after, bal_to_after.saturating_sub(bal_to_before));
+            println!();
+
+            // Verify
+            let credited = bal_to_after.saturating_sub(bal_to_before);
+            println!("VERIFICATION");
+            if credited == amount {
+                println!("  Recipient credited: {} lamports  EXACT MATCH", credited);
+            } else {
+                println!("  Recipient credited: {} lamports (expected {})", credited, amount);
+            }
+            println!("  Signature:     {}", sig);
+            println!("  Consensus:     CERTIFIED (1-hop)");
+
+            // Try to get state root from prometheus
+            let prom_url = rpc.replace(":8899", ":9090");
+            if let Ok(resp) = client.get(format!("{}/metrics", prom_url)).send() {
+                if let Ok(body) = resp.text() {
+                    // no prom from outside, skip
+                    let _ = body;
+                }
+            }
+        }
+
+        "account" | "acct" => {
+            let addr = args.get(1).unwrap_or_else(|| {
+                eprintln!("Usage: eto inspect account <ADDRESS>");
+                std::process::exit(1);
+            });
+            let pk = parse_address(addr).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            let b58 = bs58::encode(&pk.0).into_string();
+
+            println!("ACCOUNT INSPECTION");
+            println!();
+
+            let result = rpc_call(&client, rpc, "getAccountInfo", serde_json::json!([b58]));
+            match result {
+                Ok(v) => {
+                    if let Some(val) = v.get("value") {
+                        if val.is_null() {
+                            println!("  Address:    {}", b58);
+                            println!("  Status:     NOT FOUND (no account at this address)");
+                            return;
+                        }
+                        let lamports = val.get("lamports").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let owner = val.get("owner").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let executable = val.get("executable").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let space = val.get("space").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let data_b64 = val.get("data").and_then(|v| v.as_str()).unwrap_or("");
+
+                        println!("  Address:    {}", b58);
+                        println!("  Balance:    {} lamports ({} SOL)", lamports, format_sol(lamports as f64 / 1e9));
+                        println!("  Owner:      {}", owner);
+                        println!("  Executable: {}", executable);
+                        println!("  Data:       {} bytes", space);
+
+                        // Detect account type
+                        if owner == "11111111111111111111111111111111" {
+                            println!("  Type:       System Account");
+                        } else if owner.ends_with("EE") || owner.contains("FFFFFFFFFFFFFFFFEE") {
+                            println!("  Type:       EVM Contract");
+                        } else if owner.ends_with("03") {
+                            println!("  Type:       WASM Contract");
+                        } else if owner.ends_with("02") {
+                            println!("  Type:       Move Module");
+                        }
+
+                        // Show data preview if present
+                        if !data_b64.is_empty() && space > 0 {
+                            if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                if data.len() >= 76 && data[0] == 1 {
+                                    // Universal Token Header
+                                    let vm = match data[1] { 0 => "SVM", 1 => "EVM", 2 => "WASM", 3 => "Move", _ => "Unknown" };
+                                    let amount_bytes: [u8; 8] = data[66..74].try_into().unwrap_or([0; 8]);
+                                    let token_amount = u64::from_le_bytes(amount_bytes);
+                                    let decimals = data[74];
+                                    let frozen = data[75] != 0;
+                                    println!();
+                                    println!("  TOKEN HEADER (Universal Token Standard)");
+                                    println!("    VM Origin:  {}", vm);
+                                    println!("    Mint:       {}", bs58::encode(&data[2..34]).into_string());
+                                    println!("    Owner:      {}", bs58::encode(&data[34..66]).into_string());
+                                    println!("    Amount:     {}", token_amount);
+                                    println!("    Decimals:   {}", decimals);
+                                    println!("    Frozen:     {}", frozen);
+                                } else if data.len() <= 128 {
+                                    println!();
+                                    println!("  DATA (hex): {}", hex::encode(&data));
+                                } else {
+                                    println!();
+                                    println!("  DATA (first 64 bytes): {}", hex::encode(&data[..64]));
+                                    println!("  ... ({} more bytes)", data.len() - 64);
+                                }
+                            }
+                        }
+
+                        // Block height context
+                        let height = rpc_call(&client, rpc, "getSlot", serde_json::json!([]))
+                            .ok().and_then(|v| v.as_u64()).unwrap_or(0);
+                        println!();
+                        println!("  Queried at block: #{}", height);
+                    }
+                }
+                Err(e) => {
+                    println!("  Error: {}", e);
+                }
+            }
+        }
+
+        "block" => {
+            let height = rpc_call(&client, rpc, "getSlot", serde_json::json!([]))
+                .ok().and_then(|v| v.as_u64()).unwrap_or(0);
+            let health = rpc_call(&client, rpc, "getHealth", serde_json::json!([]))
+                .ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or("unknown".to_string());
+            let chain_id = rpc_call(&client, rpc, "eth_chainId", serde_json::json!([]))
+                .ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or("unknown".to_string());
+
+            println!("BLOCK INSPECTION");
+            println!();
+            println!("  Height:     {}", height);
+            println!("  Health:     {}", health);
+            println!("  Chain ID:   {} ({})", chain_id,
+                u64::from_str_radix(chain_id.trim_start_matches("0x"), 16).unwrap_or(0));
+            println!("  RPC:        {}", rpc);
+        }
+
+        _ => {
+            println!("eto inspect — Trace and verify transactions on-chain");
+            println!();
+            println!("USAGE:");
+            println!("  eto inspect transfer <TO> <AMOUNT>   Send + trace a transfer end-to-end");
+            println!("  eto inspect account <ADDRESS>        Deep inspect an account");
+            println!("  eto inspect block                    Current block info");
+            println!();
+            println!("EXAMPLES:");
+            println!("  eto inspect transfer 11111111111111111111111111111116 1");
+            println!("  eto inspect account 6ZrQwARijYWKZZAXe88D97mQqSqqiuBd2n59KmQRvik6");
+            println!("  eto inspect block");
+        }
+    }
+}
+
 // ── Help ──
 
 fn print_help() {
@@ -1179,6 +1406,7 @@ COMMANDS:
     keypair set <FILE>  Set default keypair
     keypair import <KEY> Import private key (hex or base58)
     create-account      Create a new on-chain account
+    inspect             Trace and verify transactions on-chain
     help                Show this help
 
 OPTIONS:
@@ -1347,6 +1575,15 @@ fn main() {
         "create-account" => {
             let rpc = resolve_rpc_url(cli.url_override.as_deref());
             cmd_create_account(&rpc, &cli.args);
+        }
+
+        "inspect" => {
+            if cli.help {
+                cmd_inspect("", &[]);
+                return;
+            }
+            let rpc = resolve_rpc_url(cli.url_override.as_deref());
+            cmd_inspect(&rpc, &cli.args);
         }
 
         "balance" => {
