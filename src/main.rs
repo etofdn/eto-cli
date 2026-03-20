@@ -127,6 +127,226 @@ fn resolve_rpc_url(cli_url: Option<&str>) -> String {
     DEFAULT_RPC.to_string()
 }
 
+// ── Keypair management ──
+
+fn keypair_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home).join(".config").join("eto").join("keys")
+}
+
+fn default_keypair_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home).join(".config").join("eto").join("id.json")
+}
+
+fn save_keypair(path: &std::path::Path, key: &SigningKey) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let bytes: Vec<u8> = key.to_bytes().iter().chain(key.verifying_key().to_bytes().iter()).copied().collect();
+    let json = serde_json::to_string(&bytes).unwrap();
+    std::fs::write(path, &json).unwrap_or_else(|e| {
+        eprintln!("Error writing keypair: {}", e);
+        std::process::exit(1);
+    });
+}
+
+fn load_keypair(path: &std::path::Path) -> Option<SigningKey> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let bytes: Vec<u8> = serde_json::from_str(&data).ok()?;
+    if bytes.len() >= 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&bytes[..32]);
+        Some(SigningKey::from_bytes(&seed))
+    } else {
+        None
+    }
+}
+
+fn active_keypair() -> SigningKey {
+    // Try: config keypair_path > default id.json > faucet fallback
+    let config = load_config();
+    if let Some(p) = config.get("keypair_path").and_then(|v| v.as_str()) {
+        let path = if p.starts_with('~') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(p.replacen('~', &home, 1))
+        } else {
+            std::path::PathBuf::from(p)
+        };
+        if let Some(k) = load_keypair(&path) {
+            return k;
+        }
+    }
+    if let Some(k) = load_keypair(&default_keypair_path()) {
+        return k;
+    }
+    // Fallback to faucet keypair
+    payer_keypair()
+}
+
+fn cmd_keygen(args: &[String]) {
+    let outfile = args.first().map(|s| std::path::PathBuf::from(s));
+
+    // Generate random keypair
+    let mut seed = [0u8; 32];
+    getrandom(&mut seed);
+    let key = SigningKey::from_bytes(&seed);
+    let pk = Pubkey(key.verifying_key().to_bytes());
+    let addr = bs58::encode(&pk.0).into_string();
+
+    let path = outfile.unwrap_or_else(|| {
+        let dir = keypair_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}.json", &addr[..8]))
+    });
+
+    save_keypair(&path, &key);
+
+    println!("Wrote new keypair to {}", path.display());
+    println!("{}", addr);
+}
+
+fn cmd_keygen_set_default(args: &[String]) {
+    let file = args.first().unwrap_or_else(|| {
+        eprintln!("Usage: eto keypair set <FILE>");
+        std::process::exit(1);
+    });
+    let mut config = load_config();
+    config["keypair_path"] = serde_json::Value::String(file.clone());
+    save_config(&config);
+    if let Some(k) = load_keypair(std::path::Path::new(file)) {
+        let pk = Pubkey(k.verifying_key().to_bytes());
+        println!("Default keypair: {}", bs58::encode(&pk.0).into_string());
+    } else {
+        println!("Set keypair path to: {}", file);
+    }
+}
+
+fn cmd_keypair_list() {
+    let dir = keypair_dir();
+    if !dir.exists() {
+        println!("No keypairs found. Generate one with: eto keygen");
+        return;
+    }
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
+                if let Some(k) = load_keypair(&entry.path()) {
+                    let pk = Pubkey(k.verifying_key().to_bytes());
+                    println!("  {} ({})", bs58::encode(&pk.0).into_string(), entry.file_name().to_string_lossy());
+                    count += 1;
+                }
+            }
+        }
+    }
+    // Also check default
+    if let Some(k) = load_keypair(&default_keypair_path()) {
+        let pk = Pubkey(k.verifying_key().to_bytes());
+        println!("  {} (id.json) *default*", bs58::encode(&pk.0).into_string());
+        count += 1;
+    }
+    if count == 0 {
+        println!("No keypairs found. Generate one with: eto keygen");
+    }
+}
+
+fn cmd_keypair_import(args: &[String]) {
+    let hex_or_bs58 = args.first().unwrap_or_else(|| {
+        eprintln!("Usage: eto keypair import <PRIVATE_KEY_HEX_OR_BASE58>");
+        std::process::exit(1);
+    });
+
+    let bytes = if hex_or_bs58.len() == 64 {
+        hex::decode(hex_or_bs58).unwrap_or_else(|_| {
+            eprintln!("Error: invalid hex"); std::process::exit(1);
+        })
+    } else {
+        bs58::decode(hex_or_bs58).into_vec().unwrap_or_else(|_| {
+            eprintln!("Error: invalid base58"); std::process::exit(1);
+        })
+    };
+
+    if bytes.len() < 32 {
+        eprintln!("Error: key must be at least 32 bytes");
+        std::process::exit(1);
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes[..32]);
+    let key = SigningKey::from_bytes(&seed);
+    let pk = Pubkey(key.verifying_key().to_bytes());
+    let addr = bs58::encode(&pk.0).into_string();
+
+    let dir = keypair_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.json", &addr[..8]));
+    save_keypair(&path, &key);
+
+    println!("Imported keypair: {}", addr);
+    println!("Saved to: {}", path.display());
+}
+
+fn getrandom(buf: &mut [u8]) {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .expect("open /dev/urandom")
+        .read_exact(buf)
+        .expect("read /dev/urandom");
+}
+
+fn cmd_create_account(rpc: &str, args: &[String]) {
+    let space: u64 = args.first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let lamports: u64 = args.get(1)
+        .and_then(|s| parse_amount(s).ok())
+        .unwrap_or(1_000_000_000);
+
+    // Generate new account keypair
+    let mut seed = [0u8; 32];
+    getrandom(&mut seed);
+    let new_key = SigningKey::from_bytes(&seed);
+    let new_pk = Pubkey(new_key.verifying_key().to_bytes());
+
+    let payer = active_keypair();
+    let payer_pk = pubkey_of(&payer);
+
+    let mut data = Vec::with_capacity(52);
+    data.extend_from_slice(&0u32.to_le_bytes()); // CreateAccount
+    data.extend_from_slice(&lamports.to_le_bytes());
+    data.extend_from_slice(&space.to_le_bytes());
+    data.extend_from_slice(&SYSTEM_PROGRAM.0); // owner = system
+
+    let msg = Message {
+        header: MessageHeader {
+            num_required_signatures: 2,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 1,
+        },
+        account_keys: vec![payer_pk, new_pk, SYSTEM_PROGRAM],
+        recent_blockhash: [0u8; 32],
+        instructions: vec![CompiledInstruction {
+            program_id_index: 2,
+            accounts: vec![0, 1],
+            data,
+        }],
+    };
+
+    let tx = Transaction::new(msg, &[&payer, &new_key]);
+    let tx_bytes = borsh::to_vec(&tx).expect("borsh");
+    let client = make_client();
+    match send_tx(&client, rpc, tx_bytes) {
+        Ok(sig) => {
+            println!("Signature: {}", sig);
+            println!("Account: {}", bs58::encode(&new_pk.0).into_string());
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 // ── Keypair utilities ──
 
 fn payer_keypair() -> SigningKey {
@@ -921,6 +1141,11 @@ COMMANDS:
     transaction-count   Total processed transactions
     cluster-info        Show cluster status
     address             Show default keypair address
+    keygen              Generate a new keypair
+    keypair list        List all saved keypairs
+    keypair set <FILE>  Set default keypair
+    keypair import <KEY> Import private key (hex or base58)
+    create-account      Create a new on-chain account
     help                Show this help
 
 OPTIONS:
@@ -1053,6 +1278,32 @@ fn main() {
                 return;
             }
             cmd_address();
+        }
+
+        "keygen" => {
+            if cli.help {
+                println!("eto-cli-keygen\nGenerate a new keypair\n\nUSAGE:\n    eto keygen [OUTFILE]");
+                return;
+            }
+            cmd_keygen(&cli.args);
+        }
+
+        "keypair" => {
+            let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("list");
+            match sub {
+                "list" => cmd_keypair_list(),
+                "set" => cmd_keygen_set_default(&cli.args[1..]),
+                "import" => cmd_keypair_import(&cli.args[1..]),
+                other => {
+                    eprintln!("Unknown keypair subcommand: {}. Use: list, set, import", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "create-account" => {
+            let rpc = resolve_rpc_url(cli.url_override.as_deref());
+            cmd_create_account(&rpc, &cli.args);
         }
 
         "balance" => {
