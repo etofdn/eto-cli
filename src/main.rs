@@ -1259,7 +1259,17 @@ fn main() {
             let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
             match sub {
                 "get" | "" => cmd_config_get(),
-                "set" => cmd_config_set(&cli.args[1..]),
+                "set" => {
+                    // If --url was consumed by global parser, reconstruct args
+                    let mut set_args: Vec<String> = cli.args[1..].to_vec();
+                    if let Some(ref url) = cli.url_override {
+                        if !set_args.iter().any(|a| a == "--url" || a == "-u") {
+                            set_args.push("--url".to_string());
+                            set_args.push(url.clone());
+                        }
+                    }
+                    cmd_config_set(&set_args);
+                }
                 other => {
                     eprintln!(
                         "Error: unknown config subcommand '{}'. Use 'get' or 'set'.",
