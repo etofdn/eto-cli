@@ -1408,6 +1408,8 @@ COMMANDS:
     keypair import <KEY> Import private key (hex or base58)
     create-account      Create a new on-chain account
     inspect             Trace and verify transactions on-chain
+    update              Update eto CLI to latest release
+    version             Show version
     help                Show this help
 
 OPTIONS:
@@ -1751,6 +1753,44 @@ fn main() {
         "status" => {
             let rpc = resolve_rpc_url(cli.url_override.as_deref());
             cmd_cluster_info(&rpc);
+        }
+
+        "update" => {
+            println!("Updating eto CLI...");
+            let os = std::env::consts::OS;
+            let arch = std::env::consts::ARCH;
+            let asset = match (os, arch) {
+                ("macos", "aarch64") => "eto-macos-arm64",
+                ("macos", "x86_64") => "eto-macos-x86_64",
+                ("linux", "x86_64") => "eto-linux-x86_64",
+                _ => {
+                    eprintln!("Unsupported platform: {}/{}", os, arch);
+                    eprintln!("Build from source: cargo install --path .");
+                    std::process::exit(1);
+                }
+            };
+            let url = format!("https://github.com/etofdn/eto-cli/releases/latest/download/{}.tar.gz", asset);
+            println!("Downloading {}...", asset);
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "cd /tmp && curl -sL '{}' | tar xz && sudo mv /tmp/eto /usr/local/bin/eto && echo 'Updated successfully'",
+                    url
+                ))
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    println!("eto CLI updated to latest release");
+                }
+                _ => {
+                    eprintln!("Update failed. Try manually:");
+                    eprintln!("  curl -sL {} | tar xz && sudo mv eto /usr/local/bin/", url);
+                }
+            }
+        }
+
+        "version" | "--version" | "-V" => {
+            println!("eto-cli {}", VERSION);
         }
 
         "help" | "--help" | "-h" | "" => print_help(),
