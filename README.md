@@ -59,23 +59,46 @@ eto cluster-info
 
 ## Commands
 
+### Config & Identity
 | Command | Description |
 |---------|-------------|
 | `eto config get` | Show current configuration |
 | `eto config set --url <URL>` | Set RPC endpoint |
+| `eto address` | Show default keypair address |
+| `eto keygen [OUTFILE]` | Generate a new Ed25519 keypair |
+| `eto keypair list` | List all saved keypairs |
+| `eto keypair set <FILE>` | Set default signing keypair |
+| `eto keypair import <KEY>` | Import private key (hex or base58) |
+
+### Accounts & Transfers
+| Command | Description |
+|---------|-------------|
 | `eto balance [ADDRESS]` | Show account balance |
+| `eto account <ADDRESS>` | Show full account details |
 | `eto airdrop <AMOUNT> [ADDRESS]` | Request testnet tokens |
 | `eto transfer <TO> <AMOUNT>` | Transfer tokens |
-| `eto deploy evm <HEX>` | Deploy Solidity contract |
+| `eto create-account [SPACE] [LAMPORTS]` | Create a new on-chain account |
+
+### Deploy Contracts
+| Command | Description |
+|---------|-------------|
+| `eto deploy evm <BYTECODE_HEX>` | Deploy Solidity contract |
 | `eto deploy wasm <FILE>` | Deploy WASM contract |
 | `eto deploy move <FILE>` | Deploy Move module |
+
+### ZK Operations
+| Command | Description |
+|---------|-------------|
 | `eto zk add` | BN254 EC point addition |
 | `eto zk mul` | BN254 scalar multiplication |
-| `eto account <ADDRESS>` | Show account details |
+
+### Network
+| Command | Description |
+|---------|-------------|
+| `eto cluster-info` | Health, TPS, block height |
 | `eto block-height` | Current block height |
-| `eto transaction-count` | Total transactions |
-| `eto cluster-info` | Cluster status |
-| `eto address` | Show default keypair address |
+| `eto slot` | Alias for block-height |
+| `eto transaction-count` | Total processed transactions |
 
 ## Testnet
 
