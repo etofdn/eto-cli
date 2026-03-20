@@ -288,10 +288,17 @@ fn cmd_keypair_import(args: &[String]) {
 
 fn getrandom(buf: &mut [u8]) {
     use std::io::Read;
-    std::fs::File::open("/dev/urandom")
+    let path = if cfg!(target_os = "macos") { "/dev/urandom" } else { "/dev/urandom" };
+    std::fs::File::open(path)
         .expect("open /dev/urandom")
         .read_exact(buf)
         .expect("read /dev/urandom");
+}
+
+fn random_blockhash() -> [u8; 32] {
+    let mut h = [0u8; 32];
+    getrandom(&mut h);
+    h
 }
 
 fn cmd_create_account(rpc: &str, args: &[String]) {
@@ -324,7 +331,7 @@ fn cmd_create_account(rpc: &str, args: &[String]) {
             num_readonly_unsigned_accounts: 1,
         },
         account_keys: vec![payer_pk, new_pk, SYSTEM_PROGRAM],
-        recent_blockhash: [0u8; 32],
+        recent_blockhash: random_blockhash(),
         instructions: vec![CompiledInstruction {
             program_id_index: 2,
             accounts: vec![0, 1],
@@ -482,7 +489,7 @@ fn build_svm_transfer(payer: &SigningKey, to: Pubkey, amount: u64) -> Vec<u8> {
             num_readonly_unsigned_accounts: 1,
         },
         account_keys: vec![from, to, SYSTEM_PROGRAM],
-        recent_blockhash: [0u8; 32],
+        recent_blockhash: random_blockhash(),
         instructions: vec![CompiledInstruction {
             program_id_index: 2,
             accounts: vec![0, 1],
@@ -514,7 +521,7 @@ fn build_create_account(
             num_readonly_unsigned_accounts: 1,
         },
         account_keys: vec![payer_pk, new_pk, SYSTEM_PROGRAM],
-        recent_blockhash: [0u8; 32],
+        recent_blockhash: random_blockhash(),
         instructions: vec![CompiledInstruction {
             program_id_index: 2,
             accounts: vec![0, 1],
@@ -544,7 +551,7 @@ fn build_zk_add(payer: &SigningKey) -> Vec<u8> {
             num_readonly_unsigned_accounts: 1,
         },
         account_keys: vec![pubkey_of(payer), ZK_BN254_PROGRAM_ID],
-        recent_blockhash: [2u8; 32],
+        recent_blockhash: random_blockhash(),
         instructions: vec![CompiledInstruction {
             program_id_index: 1,
             accounts: vec![0],
@@ -576,7 +583,7 @@ fn build_zk_mul(payer: &SigningKey) -> Vec<u8> {
             num_readonly_unsigned_accounts: 1,
         },
         account_keys: vec![pubkey_of(payer), ZK_BN254_PROGRAM_ID],
-        recent_blockhash: [3u8; 32],
+        recent_blockhash: random_blockhash(),
         instructions: vec![CompiledInstruction {
             program_id_index: 1,
             accounts: vec![0],
@@ -1068,23 +1075,49 @@ fn cmd_cluster_info(rpc: &str) {
         Err(_) => println!("Transaction Count: N/A"),
     }
 
-    // TPS estimate
-    let slot1 = rpc_call(&client, rpc, "getSlot", serde_json::json!([]))
-        .ok()
-        .and_then(|v| v.as_u64());
-    if let Some(s1) = slot1 {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let slot2 = rpc_call(&client, rpc, "getSlot", serde_json::json!([]))
-            .ok()
-            .and_then(|v| v.as_u64());
-        if let Some(s2) = slot2 {
-            let bps = s2.saturating_sub(s1);
-            println!("TPS: {}", bps);
+    // TPS — try Prometheus metric first (accurate), fall back to tx count delta
+    let prom_url = rpc.replace(":8899", ":9090");
+    let tps_shown = if let Ok(resp) = client.get(format!("{}/metrics", prom_url)).send() {
+        if let Ok(body) = resp.text() {
+            let tps: f64 = body.lines()
+                .find(|l| l.starts_with("eto_tps_recent "))
+                .and_then(|l| l.split_whitespace().last())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            let lifetime: f64 = body.lines()
+                .find(|l| l.starts_with("eto_tps_lifetime "))
+                .and_then(|l| l.split_whitespace().last())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            let total: u64 = body.lines()
+                .find(|l| l.starts_with("eto_transactions_total "))
+                .and_then(|l| l.split_whitespace().last())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if total > 0 {
+                println!("TPS (recent): {}", tps as u64);
+                println!("TPS (lifetime): {}", lifetime as u64);
+                println!("Transactions: {}", total);
+                true
+            } else { false }
+        } else { false }
+    } else { false };
+    if !tps_shown {
+        // Fallback: measure tx count delta over 1 second
+        let tc1 = rpc_call(&client, rpc, "getTransactionCount", serde_json::json!([]))
+            .ok().and_then(|v| v.as_u64());
+        if let Some(t1) = tc1 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let tc2 = rpc_call(&client, rpc, "getTransactionCount", serde_json::json!([]))
+                .ok().and_then(|v| v.as_u64());
+            if let Some(t2) = tc2 {
+                println!("TPS: ~{}", t2.saturating_sub(t1));
+            } else {
+                println!("TPS: N/A");
+            }
         } else {
             println!("TPS: N/A");
         }
-    } else {
-        println!("TPS: N/A");
     }
 
     // Version / Identity
