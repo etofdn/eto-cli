@@ -1588,11 +1588,303 @@ SUBCOMMANDS:
 fn print_subcommand_stub(group: &str, sub: &str) {
     eprintln!(
         "Error: 'eto {} {}' is registered but not yet implemented in this build.\n\
-         Run 'eto {} --help' for the published surface area. Implementation lands \
-         in the matching follow-up task (FN-173/174/175/177).",
+         Run 'eto {} --help' for the published surface area.",
         group, sub, group
     );
     std::process::exit(2);
+}
+
+// ── FN-173/174/175: real subcommand implementations ──
+//
+// These call backend services over HTTP. Endpoints are env-configurable so
+// dev / staging / prod can point at different gateways without a rebuild.
+
+fn beckn_url() -> String {
+    std::env::var("ETO_BECKN_URL").unwrap_or_else(|_| "http://127.0.0.1:4071".to_string())
+}
+
+fn bank_url() -> String {
+    std::env::var("ETO_BANK_URL").unwrap_or_else(|_| "http://127.0.0.1:4073".to_string())
+}
+
+fn agents_url() -> String {
+    std::env::var("ETO_API_URL").unwrap_or_else(|_| "https://agents.eto.network".to_string())
+}
+
+fn http_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("client build failed: {}", e))?;
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body.to_string());
+    if let Ok(tok) = std::env::var("ETO_AUTH_TOKEN") {
+        if !tok.is_empty() {
+            req = req.header("authorization", format!("Bearer {}", tok));
+        }
+    }
+    let res = req.send().map_err(|e| format!("request failed: {}", e))?;
+    res.json::<serde_json::Value>()
+        .map_err(|e| format!("invalid json from server: {}", e))
+}
+
+fn http_get_json(url: &str) -> Result<serde_json::Value, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("client build failed: {}", e))?;
+    let mut req = client.get(url);
+    if let Ok(tok) = std::env::var("ETO_AUTH_TOKEN") {
+        if !tok.is_empty() {
+            req = req.header("authorization", format!("Bearer {}", tok));
+        }
+    }
+    let res = req.send().map_err(|e| format!("request failed: {}", e))?;
+    res.json::<serde_json::Value>()
+        .map_err(|e| format!("invalid json from server: {}", e))
+}
+
+fn print_json(v: &serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()));
+}
+
+// ── Wallet (FN-173): wallet new | show | creds ──
+
+fn cmd_wallet_new(args: &[String]) {
+    // Alias to the existing keygen flow so we stay single-source-of-truth.
+    cmd_keygen(args);
+}
+
+fn cmd_wallet_show() {
+    cmd_address();
+}
+
+fn cmd_wallet_creds(args: &[String]) {
+    let subject = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| {
+            eprintln!("Error: usage: eto wallet creds <subject_pubkey>");
+            std::process::exit(1);
+        });
+    let url = format!("{}/credentials?subject={}", agents_url(), subject);
+    match http_get_json(&url) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ── Beckn (FN-174): search | select | init | confirm | rate ──
+
+fn cmd_beckn_search(args: &[String]) {
+    let descriptor = args.first().cloned().unwrap_or_else(|| {
+        eprintln!("Error: usage: eto beckn search <descriptor> [--category <cat>]");
+        std::process::exit(1);
+    });
+    let category = args
+        .iter()
+        .position(|a| a == "--category")
+        .and_then(|i| args.get(i + 1));
+    let mut intent = serde_json::Map::new();
+    intent.insert("descriptor".into(), serde_json::Value::String(descriptor));
+    if let Some(c) = category {
+        intent.insert("category".into(), serde_json::Value::String(c.clone()));
+    }
+    let body = serde_json::json!({ "intent": intent });
+    let url = format!("{}/beckn/search", beckn_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_beckn_select(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("Error: usage: eto beckn select <transaction_id> <provider_pubkey> <item_id>");
+        std::process::exit(1);
+    }
+    let body = serde_json::json!({
+        "context": { "transactionId": args[0] },
+        "providerPubkey": args[1],
+        "itemId": args[2],
+    });
+    let url = format!("{}/beckn/select", beckn_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_beckn_init(args: &[String]) {
+    if args.len() < 4 {
+        eprintln!(
+            "Error: usage: eto beckn init <transaction_id> <provider_pubkey> <funder_pubkey> <terms_hash_hex>"
+        );
+        std::process::exit(1);
+    }
+    let body = serde_json::json!({
+        "context": { "transactionId": args[0] },
+        "providerPubkey": args[1],
+        "funderPubkey": args[2],
+        "termsHash": args[3],
+    });
+    let url = format!("{}/beckn/init", beckn_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_beckn_confirm(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("Error: usage: eto beckn confirm <transaction_id> <terms_hash_hex> <funder_signature_hex>");
+        std::process::exit(1);
+    }
+    let body = serde_json::json!({
+        "context": { "transactionId": args[0] },
+        "termsHash": args[1],
+        "funderSignature": args[2],
+    });
+    let url = format!("{}/beckn/confirm", beckn_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_beckn_rate(args: &[String]) {
+    if args.len() < 2 {
+        eprintln!("Error: usage: eto beckn rate <transaction_id> <rating> [comment]");
+        std::process::exit(1);
+    }
+    let rating: f64 = args[1]
+        .parse()
+        .unwrap_or_else(|_| {
+            eprintln!("Error: rating must be a number in [0, 5]");
+            std::process::exit(1);
+        });
+    let mut body = serde_json::json!({
+        "context": { "transactionId": args[0] },
+        "rating": rating,
+    });
+    if let Some(c) = args.get(2) {
+        body["comment"] = serde_json::Value::String(c.clone());
+    }
+    let url = format!("{}/beckn/rate", beckn_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ── Bank (FN-175): open | balance | onramp | offramp ──
+
+fn cmd_bank_open(args: &[String]) {
+    if args.len() < 2 {
+        eprintln!("Error: usage: eto bank open <owner_pubkey> <kyc_credential_id> [--label <label>]");
+        std::process::exit(1);
+    }
+    let label = args
+        .iter()
+        .position(|a| a == "--label")
+        .and_then(|i| args.get(i + 1));
+    let mut body = serde_json::json!({
+        "ownerPubkey": args[0],
+        "kycCredentialId": args[1],
+    });
+    if let Some(l) = label {
+        body["label"] = serde_json::Value::String(l.clone());
+    }
+    let url = format!("{}/banking/open-checking", bank_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_bank_balance(args: &[String]) {
+    let account_id = args.first().cloned().unwrap_or_else(|| {
+        eprintln!("Error: usage: eto bank balance <account_id>");
+        std::process::exit(1);
+    });
+    let url = format!("{}/banking/balance?accountId={}", bank_url(), account_id);
+    match http_get_json(&url) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_bank_onramp(args: &[String]) {
+    if args.len() < 2 {
+        eprintln!("Error: usage: eto bank onramp <source_account_id> <gross_cents>");
+        std::process::exit(1);
+    }
+    let cents: u64 = args[1].parse().unwrap_or_else(|_| {
+        eprintln!("Error: gross_cents must be a positive integer");
+        std::process::exit(1);
+    });
+    let body = serde_json::json!({
+        "sourceAccountId": args[0],
+        "grossCents": cents,
+    });
+    let url = format!("{}/banking/onramp", bank_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_bank_offramp(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("Error: usage: eto bank offramp <source_account_id> <destination_account_id> <net_cents>");
+        std::process::exit(1);
+    }
+    let cents: u64 = args[2].parse().unwrap_or_else(|_| {
+        eprintln!("Error: net_cents must be a positive integer");
+        std::process::exit(1);
+    });
+    let body = serde_json::json!({
+        "sourceAccountId": args[0],
+        "destinationAccountId": args[1],
+        "netCents": cents,
+    });
+    let url = format!("{}/banking/offramp", bank_url());
+    match http_post_json(&url, &body) {
+        Ok(v) => print_json(&v),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 // ── Main ──
@@ -1887,6 +2179,9 @@ fn main() {
             let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
             match sub {
                 "" | "help" | "--help" | "-h" => print_singularity_help(),
+                // Singularity credential ops are still backend-side (FN-177
+                // ships them as MCP tools first); CLI direct calls land in
+                // a follow-up.
                 "issue" | "verify" | "revoke" | "list" => {
                     print_subcommand_stub("singularity", sub);
                 }
@@ -1906,11 +2201,14 @@ fn main() {
                 return;
             }
             let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+            let rest: Vec<String> = cli.args.iter().skip(1).cloned().collect();
             match sub {
                 "" | "help" | "--help" | "-h" => print_beckn_help(),
-                "search" | "select" | "init" | "confirm" | "rate" => {
-                    print_subcommand_stub("beckn", sub);
-                }
+                "search" => cmd_beckn_search(&rest),
+                "select" => cmd_beckn_select(&rest),
+                "init" => cmd_beckn_init(&rest),
+                "confirm" => cmd_beckn_confirm(&rest),
+                "rate" => cmd_beckn_rate(&rest),
                 other => {
                     eprintln!(
                         "Error: unknown 'beckn' subcommand '{}'. Run 'eto beckn --help'.",
@@ -1931,6 +2229,10 @@ fn main() {
             let rpc = resolve_rpc_url(cli.url_override.as_deref());
             match sub {
                 "" | "help" | "--help" | "-h" => print_wallet_help(),
+                // FN-173 — wallet new / show / creds
+                "new" => cmd_wallet_new(&rest),
+                "show" => cmd_wallet_show(),
+                "creds" => cmd_wallet_creds(&rest),
                 "balance" => {
                     cmd_balance(&rpc, rest.first().map(|s| s.as_str()));
                 }
@@ -1973,9 +2275,16 @@ fn main() {
                 return;
             }
             let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+            let rest: Vec<String> = cli.args.iter().skip(1).cloned().collect();
             match sub {
                 "" | "help" | "--help" | "-h" => print_bank_help(),
-                "open-checking" | "onramp" | "offramp" | "wire" | "transfer-funds" => {
+                // FN-175 — bank open / balance / onramp / offramp
+                "open" | "open-checking" => cmd_bank_open(&rest),
+                "balance" => cmd_bank_balance(&rest),
+                "onramp" => cmd_bank_onramp(&rest),
+                "offramp" => cmd_bank_offramp(&rest),
+                "wire" | "transfer-funds" => {
+                    // wire / transfer-funds land in a follow-up; expose stub.
                     print_subcommand_stub("bank", sub);
                 }
                 other => {
