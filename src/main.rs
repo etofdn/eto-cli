@@ -1509,6 +1509,92 @@ USAGE:
     );
 }
 
+// ── FN-172: subcommand-group scaffolding ──
+//
+// These four groups (singularity / beckn / wallet / bank) are the
+// public-facing namespace the CLI ships with. Individual subcommands
+// inside each group are filled in by follow-up tasks
+// (FN-173 wallet, FN-174 beckn, FN-175 bank). For now we publish the
+// surface area + per-group help so `eto <group>` and `eto <group> --help`
+// both produce useful output without missing handlers.
+
+fn print_singularity_help() {
+    println!(
+        "eto-cli-singularity
+Singularity ID + credential operations
+
+USAGE:
+    eto singularity <SUBCOMMAND>
+
+SUBCOMMANDS:
+    issue       Request a credential to be issued to a subject (FN-177)
+    verify      Verify a credential's signature + revocation status
+    revoke      Flag a credential as revoked at the issuer
+    list        List credentials attached to an AgentCard"
+    );
+}
+
+fn print_beckn_help() {
+    println!(
+        "eto-cli-beckn
+Beckn protocol flow operations
+
+USAGE:
+    eto beckn <SUBCOMMAND>
+
+SUBCOMMANDS:
+    search      Discover BPP providers offering a category of work
+    select      Narrow a search context to a provider + item
+    init        Propose terms (lock-step before confirm)
+    confirm     Commit terms + lock escrow
+    rate        Post-fulfillment rating + comment"
+    );
+}
+
+fn print_wallet_help() {
+    println!(
+        "eto-cli-wallet
+Wallet, key, and balance operations
+
+USAGE:
+    eto wallet <SUBCOMMAND>
+
+SUBCOMMANDS:
+    balance [ADDRESS]   Show balance (alias for `eto balance`)
+    address             Show default keypair address (alias for `eto address`)
+    transfer <to> <lamports>  Transfer native (alias for `eto transfer`)
+    keys list           List local keypairs (alias for `eto keypair list`)
+    keys import <path>  Import keypair (alias for `eto keypair import`)"
+    );
+}
+
+fn print_bank_help() {
+    println!(
+        "eto-cli-bank
+Bank-as-BPP operations (FN-115/107/108/119)
+
+USAGE:
+    eto bank <SUBCOMMAND>
+
+SUBCOMMANDS:
+    open-checking   Open an eUSD checking account (KYC-gated)
+    onramp          USD → eUSD with the 1pip fee
+    offramp         eUSD → USD with reconciliation
+    wire            Send a wire transfer (lock → release)
+    transfer-funds  Internal eUSD ↔ eUSD between two accounts"
+    );
+}
+
+fn print_subcommand_stub(group: &str, sub: &str) {
+    eprintln!(
+        "Error: 'eto {} {}' is registered but not yet implemented in this build.\n\
+         Run 'eto {} --help' for the published surface area. Implementation lands \
+         in the matching follow-up task (FN-173/174/175/177).",
+        group, sub, group
+    );
+    std::process::exit(2);
+}
+
 // ── Main ──
 
 fn main() {
@@ -1785,6 +1871,119 @@ fn main() {
                 _ => {
                     eprintln!("Update failed. Try manually:");
                     eprintln!("  curl -sL {} | tar xz && sudo mv eto /usr/local/bin/", url);
+                }
+            }
+        }
+
+        // FN-172: subcommand-group scaffolds. Each group prints help when
+        // invoked bare or with --help; otherwise dispatches to a matching
+        // implementation (existing flat command for wallet aliases, stub
+        // for the rest until follow-up tasks land).
+        "singularity" => {
+            if cli.help {
+                print_singularity_help();
+                return;
+            }
+            let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+            match sub {
+                "" | "help" | "--help" | "-h" => print_singularity_help(),
+                "issue" | "verify" | "revoke" | "list" => {
+                    print_subcommand_stub("singularity", sub);
+                }
+                other => {
+                    eprintln!(
+                        "Error: unknown 'singularity' subcommand '{}'. Run 'eto singularity --help'.",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "beckn" => {
+            if cli.help {
+                print_beckn_help();
+                return;
+            }
+            let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+            match sub {
+                "" | "help" | "--help" | "-h" => print_beckn_help(),
+                "search" | "select" | "init" | "confirm" | "rate" => {
+                    print_subcommand_stub("beckn", sub);
+                }
+                other => {
+                    eprintln!(
+                        "Error: unknown 'beckn' subcommand '{}'. Run 'eto beckn --help'.",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "wallet" => {
+            if cli.help {
+                print_wallet_help();
+                return;
+            }
+            let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+            let rest: Vec<String> = cli.args.iter().skip(1).cloned().collect();
+            let rpc = resolve_rpc_url(cli.url_override.as_deref());
+            match sub {
+                "" | "help" | "--help" | "-h" => print_wallet_help(),
+                "balance" => {
+                    cmd_balance(&rpc, rest.first().map(|s| s.as_str()));
+                }
+                "address" => cmd_address(),
+                "transfer" => {
+                    if rest.len() < 2 {
+                        eprintln!("Error: usage: eto wallet transfer <to> <lamports>");
+                        std::process::exit(1);
+                    }
+                    cmd_transfer(&rpc, &rest[0], &rest[1]);
+                }
+                "keys" => {
+                    let keys_sub = rest.first().map(|s| s.as_str()).unwrap_or("");
+                    let keys_rest: Vec<String> = rest.iter().skip(1).cloned().collect();
+                    match keys_sub {
+                        "list" => cmd_keypair_list(),
+                        "import" => cmd_keypair_import(&keys_rest),
+                        other => {
+                            eprintln!(
+                                "Error: unknown 'wallet keys' subcommand '{}'. Try 'list' or 'import'.",
+                                other
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                other => {
+                    eprintln!(
+                        "Error: unknown 'wallet' subcommand '{}'. Run 'eto wallet --help'.",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "bank" => {
+            if cli.help {
+                print_bank_help();
+                return;
+            }
+            let sub = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+            match sub {
+                "" | "help" | "--help" | "-h" => print_bank_help(),
+                "open-checking" | "onramp" | "offramp" | "wire" | "transfer-funds" => {
+                    print_subcommand_stub("bank", sub);
+                }
+                other => {
+                    eprintln!(
+                        "Error: unknown 'bank' subcommand '{}'. Run 'eto bank --help'.",
+                        other
+                    );
+                    std::process::exit(1);
                 }
             }
         }
